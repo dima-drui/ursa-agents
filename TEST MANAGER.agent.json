@@ -1,0 +1,1698 @@
+{
+  "version": "1.0",
+  "exportedAt": "2026-11-17T06:47:07.101Z",
+  "workspace": {
+    "name": "Test Squad",
+    "description": ""
+  },
+  "agent": {
+    "refId": "test-manager",
+    "name": "TEST MANAGER",
+    "description": "",
+    "nodes": [
+      {
+        "id": "input",
+        "type": "input",
+        "data": {
+          "schema": {
+            "text": {
+              "type": "string",
+              "required": false
+            }
+          }
+        }
+      },
+      {
+        "id": "output",
+        "type": "output",
+        "data": {
+          "report": "{{node:js-report.output.html}}",
+          "tickets": "{{node:js-report.output.tickets}}",
+          "totals": "{{node:js-report.output.totals}}"
+        }
+      },
+      {
+        "id": "jira-tasks",
+        "type": "http",
+        "data": {
+          "method": "GET",
+          "url": "{{var:JIRA_HOST}}/rest/api/3/search/jql?jql=assignee%3DcurrentUser()%20AND%20status%3D%22In%20Testing%22&maxResults=100&fields=summary,status",
+          "headers": {
+            "Authorization": "Basic {{secret:Jira_auth}}",
+            "Accept": "application/json"
+          },
+          "persistedFields": []
+        }
+      },
+      {
+        "id": "js-map-tasks",
+        "type": "js",
+        "data": {
+          "timeout": 5000,
+          "memoryMb": 64,
+          "input": {
+            "issues": "{{node:jira-tasks.response.issues}}",
+            "text": "{{node:input.text}}"
+          },
+          "code": "const { issues, text } = input;\n\nconst list = Array.isArray(issues) ? issues : [];\nconst q = String(text || '').trim().toLowerCase();\n\n// Optional filter from input.text: a ticket key or a part of the summary\nconst filtered = q\n  ? list.filter(t => {\n      const summary = String((t.fields && t.fields.summary) || '').toLowerCase();\n      return String(t.key).toLowerCase() === q || summary.includes(q);\n    })\n  : list;\n\noutput = filtered.map(t => ({\n  taskId: t.key,\n  summary: (t.fields && t.fields.summary) || '',\n}));\n",
+          "persistedFields": []
+        }
+      },
+      {
+        "id": "jira-collect-meta",
+        "type": "agent",
+        "data": {
+          "agentId": "jira-ticket-meta",
+          "inputs": "{{node:js-map-tasks.output}}"
+        }
+      },
+      {
+        "id": "testers-manager",
+        "type": "agent",
+        "data": {
+          "agentId": "testers",
+          "inputs": "{{node:jira-collect-meta.output}}"
+        }
+      },
+      {
+        "id": "js-report",
+        "type": "js",
+        "data": {
+          "timeout": 10000,
+          "memoryMb": 64,
+          "input": {
+            "meta": "{{node:jira-collect-meta.output}}",
+            "results": "{{node:testers-manager.output}}"
+          },
+          "code": "const toArr = v => Array.isArray(v) ? v : (v ? [v] : []);\nconst meta = toArr(input.meta);\nconst results = toArr(input.results);\n\nconst esc = s => String(s == null ? '' : s)\n  .replace(/&/g, '&amp;')\n  .replace(/</g, '&lt;')\n  .replace(/>/g, '&gt;')\n  .replace(/\"/g, '&quot;');\n\nconst short = v => {\n  if (v == null || v === '') {\n    return '';\n  }\n  const s = typeof v === 'string' ? v : JSON.stringify(v, null, 2);\n  return s.length > 3000 ? s.slice(0, 3000) + '\\n... (truncated)' : s;\n};\n\n// Merge Jira meta and tester results by index\nconst tickets = meta.map((m, i) => {\n  const r = results[i] || {};\n  const platform = r.platform ? String(r.platform).trim().toLowerCase() : 'unknown';\n  return {\n    jiraId: m.jiraId || '',\n    summary: m.summary || r.summary || '',\n    platform,\n    route: r.route || '',\n    web: r.baas == null ? null : r.baas,\n    ios: r.maas == null ? null : r.maas\n  };\n});\n\nconst totals = {\n  total: tickets.length,\n  web: tickets.filter(t => t.platform === 'web').length,\n  ios: tickets.filter(t => t.platform === 'ios').length,\n  both: tickets.filter(t => t.platform === 'both').length,\n  unknown: tickets.filter(t => !['web', 'ios', 'both'].includes(t.platform)).length\n};\n\nconst rows = tickets.map(t => {\n  const details = [];\n  if (t.web != null) {\n    details.push('<b>Web</b><pre>' + esc(short(t.web)) + '</pre>');\n  }\n  if (t.ios != null) {\n    details.push('<b>iOS</b><pre>' + esc(short(t.ios)) + '</pre>');\n  }\n  return (\n    '<tr>' +\n    '<td>' + esc(t.jiraId) + '</td>' +\n    '<td>' + esc(t.summary) + '</td>' +\n    '<td>' + esc(t.platform) + '</td>' +\n    '<td><details><summary>show</summary>' + details.join('') + '</details></td>' +\n    '</tr>'\n  );\n}).join('');\n\nconst html = (\n  '<!doctype html><html><head><meta charset=\"utf-8\"><style>' +\n  'body{font-family:system-ui,sans-serif;margin:16px;background:#fff;color:#111}' +\n  'table{border-collapse:collapse;width:100%}' +\n  'th,td{border:1px solid #ddd;padding:6px 8px;text-align:left;vertical-align:top;font-size:13px}' +\n  'th{background:#f3f4f6}' +\n  'pre{white-space:pre-wrap;word-break:break-word;font-size:11px;background:#f9fafb;padding:6px;max-height:240px;overflow:auto}' +\n  '</style></head><body>' +\n  '<h3>Test report</h3>' +\n  '<p>Tickets: ' + totals.total +\n  ' | web: ' + totals.web +\n  ' | ios: ' + totals.ios +\n  ' | both: ' + totals.both +\n  ' | unknown: ' + totals.unknown + '</p>' +\n  '<table><tr><th>Jira</th><th>Summary</th><th>Platform</th><th>Result</th></tr>' +\n  rows +\n  '</table></body></html>'\n);\n\nreturn { html, tickets, totals };\n"
+        }
+      }
+    ],
+    "editorData": {
+      "nodePositions": {
+        "input": {
+          "x": 111,
+          "y": -51
+        },
+        "output": {
+          "x": 113,
+          "y": 482
+        },
+        "jira-tasks": {
+          "x": 131,
+          "y": 106
+        },
+        "js-map-tasks": {
+          "x": 131,
+          "y": 226
+        },
+        "jira-collect-meta": {
+          "x": 358,
+          "y": 125
+        },
+        "testers-manager": {
+          "x": 358,
+          "y": 242
+        },
+        "js-report": {
+          "x": 452,
+          "y": 408
+        }
+      },
+      "viewport": {
+        "x": 477.45359559855376,
+        "y": 132.0119798220466,
+        "zoom": 0.9645981845841376
+      },
+      "canvasSettings": {
+        "layoutDirection": "TB"
+      }
+    }
+  },
+  "dependencies": [
+    {
+      "refId": "jira-ticket-meta",
+      "name": "JIRA ticket meta",
+      "description": "",
+      "nodes": [
+        {
+          "id": "input",
+          "type": "input",
+          "data": {
+            "schema": {
+              "taskId": {
+                "type": "string",
+                "required": true
+              },
+              "summary": {
+                "type": "string",
+                "required": false
+              }
+            }
+          }
+        },
+        {
+          "id": "output",
+          "type": "output",
+          "data": {
+            "summary": "{{node:map.output.summary}}",
+            "description": "{{node:map.output.description}}",
+            "comments": "{{node:map.output.comments}}",
+            "jiraId": "{{node:map.output.jiraId}}"
+          }
+        },
+        {
+          "id": "jira",
+          "type": "http",
+          "data": {
+            "method": "GET",
+            "url": "{{var:JIRA_HOST}}/rest/api/2/issue/{{node:input.taskId}}",
+            "headers": {
+              "Authorization": "Basic {{secret:Jira_auth}}",
+              "Accept": "application/json"
+            },
+            "persistedFields": []
+          }
+        },
+        {
+          "id": "map",
+          "type": "js",
+          "data": {
+            "input": {
+              "d": "{{node:jira.response}}",
+              "c": "{{node:jira-comments.response}}"
+            },
+            "code": "const { d, c } = input;\n\nconst { \n  summary = \"\", \n  description = '(no description provided)'\n} = d.fields || {}; \n\nconst commentsArr = c.comments || []; \nconst comments = commentsArr.length \n    ? commentsArr.map( c => c.body || '' ).join('\\n\\n') \n    : '(no comments)'\n\nreturn { \n  jiraId: d.key, \n  summary, \n  description, \n  comments \n};",
+            "persistedFields": [
+              "input"
+            ]
+          }
+        },
+        {
+          "id": "jira-comments",
+          "type": "http",
+          "data": {
+            "method": "GET",
+            "url": "{{var:JIRA_HOST}}/rest/api/2/issue/{{node:input.taskId}}/comment",
+            "headers": {
+              "Authorization": "Basic {{secret:Jira_auth}}",
+              "Accept": "application/json"
+            },
+            "persistedFields": []
+          }
+        }
+      ],
+      "editorData": {
+        "nodePositions": {
+          "input": {
+            "x": 178,
+            "y": -141
+          },
+          "output": {
+            "x": 180,
+            "y": 342
+          },
+          "jira": {
+            "x": 114,
+            "y": 38
+          },
+          "map": {
+            "x": 199,
+            "y": 177
+          },
+          "jira-comments": {
+            "x": 283,
+            "y": 39
+          }
+        },
+        "viewport": {
+          "x": 404.99968916892095,
+          "y": 196.17674984721629,
+          "zoom": 0.8705505632961235
+        }
+      }
+    },
+    {
+      "refId": "browser-executor",
+      "name": "Browser executor",
+      "description": "",
+      "nodes": [
+        {
+          "id": "input",
+          "type": "input",
+          "data": {
+            "schema": {
+              "sessionID": {
+                "type": "string",
+                "required": true
+              },
+              "testStepDescription": {
+                "type": "string",
+                "required": true
+              },
+              "testStepExpectedResult": {
+                "type": "string",
+                "required": true
+              }
+            }
+          }
+        },
+        {
+          "id": "baas-actions",
+          "type": "http",
+          "data": {
+            "method": "GET",
+            "url": "{{var:BAAS_HOST}}/api/async/actions",
+            "headers": {
+              "Content-Type": "application/json",
+              "Authorization": "Bearer {{secret:BAAS_API_KEY}}"
+            }
+          }
+        },
+        {
+          "id": "baas-screenshot",
+          "type": "http",
+          "data": {
+            "method": "POST",
+            "url": "{{var:BAAS_HOST}}/api/async/message",
+            "headers": {
+              "Content-Type": "application/json",
+              "Authorization": "Bearer {{secret:BAAS_API_KEY}}"
+            },
+            "body": {
+              "program": "takeScreenshot('screenshot', 'timeout:10s'); innerHtml('body', 'timeout:10s')",
+              "sessionID": "{{node:input.sessionID}}",
+              "stopSession": false
+            },
+            "persistedFields": []
+          }
+        },
+        {
+          "id": "llm-1",
+          "type": "llm",
+          "data": {
+            "provider": "anthropic",
+            "model": "claude-sonnet-5-5",
+            "systemPrompt": "# Role\n\nYou are an experienced QA engineer.\n\n# Inputs\n\nYou will receive:\n\n1. **Task**: the behavior or bug to verify.\n2. **Expectations**: what should happen when the behavior works correctly (i.e., the bug is fixed).\n3. **Screenshot**: the page currently open in the platform.\n\n# Workflow\n\nFollow these steps in order. Do not skip any step.\n\n## Step 1: Identify the starting page\n\nLook at the screenshot and choose the page it shows. This is the initial page for the Page Object Pattern. \n\n## Step 2: Write a new test step (only if there is no match)\n\nWrite one test step and one expected result that verify the Task. Set `from_memory` to `false` and `page` to the value from Step 1.\nThe step MUST be specific and executable. It should:\n\n- Name the exact button, link, or control to click, using its visible label in single quotes (e.g., 'Raise Issue').\n- Name the exact item to act on, using the text visible in the screenshot (e.g., the 'make baas better' to-do).\n- State how many times to click or repeat an action if it is more than once.\n- State any values to type or options to select.\nThe expected result MUST describe an observable UI change that confirms the fix, naming the specific element and its new state.\n\n\n# Output format\n\nRespond with ONLY a single JSON object. Do not add any text, explanation, or markdown code fences before or after it.\nThe object must have exactly these 4 keys:\n\n- \"stepDescription\" (string): the action to perform.\n- \"stepExpectedResult\" (string): what should happen if the bug is fixed.\n- \"page\" (string): the starting page, one value from the list in Step 1.\n\n\n# Examples\n\n## Bad (too vague: says \"one of the to-dos\" and does not describe a visible change)\n\n{\"stepDescription\": \"Click the 'Raise Issue' button on one of the to-dos\", \"stepExpectedResult\": \"The selected to-do is marked as raised to IDS\", \"page\": \"Active Meeting\" }\n\n## Good (names the exact item and the exact visible change)\n\n{\"stepDescription\": \"Click the 'Raise Issue' button on the 'make baas better' to-do once\", \"stepExpectedResult\": \"The 'make baas better' to-do shows an 'In IDS' button and the 'Raise Issue' button is no longer visible\", \"page\": \"Active Meeting\", \"from\\_memory\": false}\n\n# Final reminders\n- Output only the JSON object and nothing else.\n\n",
+            "userPrompt": "<task> {{node:input.testStepDescription}}</task>\n<expectations> {{node:input.testStepExpectedResult}}</expectations>\n <screenshot>: {{node:baas-screenshot.response..screenshots.screenshot}} </screenshot>",
+            "temperature": 0.7,
+            "maxTokens": 10000,
+            "tools": "",
+            "maxToolCalls": 2,
+            "persistedFields": [
+              "userPrompt"
+            ]
+          }
+        },
+        {
+          "id": "llm-2",
+          "type": "llm",
+          "data": {
+            "provider": "anthropic",
+            "model": "claude-sonnet-5-5",
+            "role": "assistant",
+            "content": "sleep('1s'); ",
+            "systemPrompt": "You are an expert at writing JS-like code that controls a browser. Given a task and the HTML of the currently open page, you emit a JS program that performs the task. \n You may ONLY use the functions described in this JSON. No other functions, no standard JS library calls: {{node:baas-actions.response.output}} \n OPTIONS \n Every function accepts extra string arguments of the form '&lt;optionName&gt;:&lt;optionValue&gt;'. \n Supported: 'timeout:10s' (Go duration format), 'selector:&lt;css selector&gt;'. \n Add a timeout option to every wait function.\n NAVIGATION \n\n- The browser is already open on a page. Do NOT navigate unless the task asks you to.\n- If asked to navigate, only open the URL. Do not log in, do not fill forms.\n- When you need to click on item in main menu, use clickN('nav>a', N) where N starts from 0.\n- When you need to navigate inside the active L10 meeting, use clickN('button.p-2', N) where N starts from 0, for example clickN('button.p-2', 3) to go to Headlines.\n- Always use navigateStatus, never navigate. Assign it to a variable and check it with if. Never use the || operator.\n var status = navigateStatus('[https://example.com](https://example.com)'); if (status != 200) { throw 'got ' + status; }\n- Always sleep after navigating, clicking, or submitting.\n- Never use navigate when you need to click button.  \n WAITING\n- Waiting for a specific text: waitForText or waitForHtml, not waitReady.\n- Only checking whether text exists (no waiting needed): isTextPresent.\n- Reading text: text or llmText. Never read text through selectors.\n- waitReady is for generic page readiness only.\n SELECTORS\n- Prefer HTML/CSS locators. Use llm-based functions only when no locator can be found.\n- Prefer to use `id` locator if the element have it.\n- Never use llmClick or llmClickElement for login buttons.\n- Never invent a selector. If you do not know it, use llmClickElement (not llmClick) with the specific HTML tag.\n- Use attribute selectors only when the attribute is visible in the HTML.\n- NEVER use selectors like `a:contains(<text>)`, `button[<text>]` or `a:has-text(<text>)`. These selectors will never work. \n- When clicking an element identified by its text, infer the likely tag from context: it may be a, div, span, button, etc.\n- When you need to click on IDS name in the list, use clickN(`section>div`, N). First issue in a list will be clickN(`section>div`, 2).\n- When ou need to click the dot next to participant name in the participant list, use clickN('button\\[data-slot=\"dropdown-trigger\"\\]', N). First dot in a list will be clickN('button\\[data-slot=\"dropdown-trigger\"\\]', 2).\n- When you need to click on `Add to IDS` button, use button\\[id=\"&lt;insert actual id here&gt;\"\\].\n INTERACTION\n- Use id locator if element has it, for example: `button[id=\"<uniq number here>\"]`\n- Use clickN(selector, N) when the selector could match several elements. Count elements starting from 0! Check all HTML from the beginning to find correct N. Use click(selector) only when the selector is unique, e.g. an exact href.\n- Prefer clicking a button over submitting a form.\n- Always click an element before sending keys to it.\n- Use sendKeysToElement, never sendKeys.\n WHEN THE ELEMENT IS NOT IN THE HTML\n Do not explain, do not search out loud, do not report that you could not find it. Emit llmClickElement('&lt;visible text&gt;', '&lt;likely tag&gt;'); and continue.\n WHEN NO ACTION IS NEEDED\n If the page is already in the requested state, the whole response is: takeScreenshot('screenshot', 'timeout:10s'); sleep('1s');\n OUTPUT\n- One single line. No line breaks anywhere.\n- No template literals. Escape double quotes with a backslash.\n- Every response starts with takeScreenshot('screenshot', 'timeout:10s'); and ends with sleep('1s');\n\n",
+            "userPrompt": "<task> {{node:js-llm-1.output.testStepDescription}}</task>\n <html>: {{node:baas-screenshot.response.outHtml}} </html>",
+            "temperature": 0.7,
+            "maxTokens": 10000,
+            "persistedFields": [
+              "userPrompt"
+            ]
+          }
+        },
+        {
+          "id": "output",
+          "type": "output",
+          "data": {
+            "status": "{{node:js-prepare-res.output.analyze.status}}",
+            "comment": "{{node:js-prepare-res.output.analyze.comment}}",
+            "error": "{{node:js-prepare-res.output.error}}"
+          }
+        },
+        {
+          "id": "baas-message",
+          "type": "http",
+          "data": {
+            "method": "POST",
+            "url": "{{var:BAAS_HOST}}/api/async/message",
+            "headers": {
+              "Content-Type": "application/json",
+              "Authorization": "Bearer {{secret:BAAS_API_KEY}}"
+            },
+            "body": {
+              "program": "{{node:llm-2.response}} sleep('3s'); takeScreenshot('screenshot', 'timeout:10s');",
+              "sessionID": "{{node:input.sessionID}}",
+              "stopSession": false
+            },
+            "persistedFields": [
+              "body",
+              "sseEvents"
+            ]
+          }
+        },
+        {
+          "id": "result-analyzer",
+          "type": "llm",
+          "data": {
+            "provider": "anthropic",
+            "model": "claude-sonnet-5-5",
+            "systemPrompt": "You are an experienced QA engineer \n\nYou will be given:\n\n1. A test step description (context for what the tester was trying to do)\n2. The expected result of that test step\n3. A screenshot before the test step execution\n4. A screenshot of the actual result\n\n# Your Task\n\nFrom the `Screenshot before test step` guess the initial test page name for page object pattern Compare the screenshots against the expected result, using the test step description as context. Decide whether the test succeeded, failed, or is broken, following the rules below. Then write a comment explaining your decision. \n\n# Status Decision Rules (check in this order)\n\n1. **broken** — You cannot understand the test description, OR the screenshot is missing/empty/unreadable.\n2. **test\\_broken** — The test description/expected result is itself flawed or inconsistent (e.g., a required input field is empty when it should have been filled in as a precondition — this is a strong signal for test\\_broken). Or you can't verify the step result cause you are on a wrong page. Or both the before and after screenshots are identical\n3. **success** — The screenshot shows the expected end state was reached, per the 'judge the end state' principle above — even if the literal button-click isn't visible in the screenshot.\n4. **failed** — The page shows an unexpected error message, or the actual end state genuinely does not match the expected result (not just 'the click isn't visible').\n\n# Output Format\n\nReturn exactly one raw JSON object. No arrays, no markdown, no code fences, no triple backticks, no extra text before or after.\n{\"stepDescription\": \"exact `Test step description` from user input\",\n  \"status\": \"success | failed | broken | test\\_broken\",\n  \"comment\": \"Detailed explanation of why you reached this decision, referencing what you saw in the screenshot vs. the expected result.\",\n  \"page\":\"Test page name here\"}",
+            "userPrompt": "Test step description: {{node:js-llm-1.output.stepDescription}}. Test step expected result: {{node:js-llm-1.output.stepExpectedResult}},The Screenshot before test step: {{node:baas-screenshot.response.screenshots.screenshot}}. The Screenshot of the result: {{node:baas-message.response.screenshots.screenshot}}",
+            "temperature": 0.7
+          }
+        },
+        {
+          "id": "js-prepare-res",
+          "type": "js",
+          "data": {
+            "timeout": 5000,
+            "memoryMb": 64,
+            "input": "{ \"a\": {{node:result-analyzer.response}}, \"m\": {{node:baas-message.response}} }",
+            "code": "const { a, m } = input;\nconst { error, screenshots } = m;\n\nconst analyze = a;\n\nif (error) {\n  output = { \n    analyze, \n    error: { error, screenshot: screenshots.screenshot } \n  };\n}\nelse {\n  output = { analyze };\n}\n\n"
+          }
+        },
+        {
+          "id": "js-llm-1",
+          "type": "js",
+          "data": {
+            "timeout": 5000,
+            "memoryMb": 64,
+            "input": "{{node:llm-1.response}}",
+            "code": "output = input;"
+          }
+        }
+      ],
+      "editorData": {
+        "nodePositions": {
+          "input": {
+            "x": 59,
+            "y": -79
+          },
+          "baas-actions": {
+            "x": 195,
+            "y": 58
+          },
+          "baas-screenshot": {
+            "x": 342,
+            "y": 58
+          },
+          "llm-1": {
+            "x": 268,
+            "y": 188
+          },
+          "llm-2": {
+            "x": 196,
+            "y": 432
+          },
+          "output": {
+            "x": 212,
+            "y": 849
+          },
+          "baas-message": {
+            "x": 116,
+            "y": 563
+          },
+          "result-analyzer": {
+            "x": 348,
+            "y": 579
+          },
+          "js-prepare-res": {
+            "x": 116,
+            "y": 708
+          },
+          "js-llm-1": {
+            "x": 269,
+            "y": 305
+          }
+        },
+        "viewport": {
+          "x": 632.2933141275098,
+          "y": 116.40876634586203,
+          "zoom": 0.7340753180170541
+        }
+      }
+    },
+    {
+      "refId": "browser-descriptor",
+      "name": "Browser descriptor",
+      "description": "",
+      "nodes": [
+        {
+          "id": "input",
+          "type": "input",
+          "data": {
+            "schema": {
+              "sessionID": {
+                "type": "string",
+                "required": true
+              },
+              "testStepDescription": {
+                "type": "string",
+                "required": true
+              },
+              "testStepExpectedResult": {
+                "type": "string",
+                "required": true
+              }
+            }
+          }
+        },
+        {
+          "id": "http-1",
+          "type": "http",
+          "data": {
+            "method": "POST",
+            "url": "{{var:BAAS_HOST}}/api/async/message",
+            "headers": {
+              "Content-Type": "application/json",
+              "Authorization": "Bearer {{secret:BAAS_API_KEY}}"
+            },
+            "body": {
+              "program": "takeScreenshot('screenshot', 'timeout:10s');",
+              "sessionID": "{{node:input.sessionID}}",
+              "stopSession": false
+            },
+            "persistedFields": []
+          }
+        },
+        {
+          "id": "js-1",
+          "type": "js",
+          "data": {
+            "input": "{{node:http-1.response}}",
+            "code": "if (typeof input === 'string') { \n  output = JSON.parse(input) \n} \nelse { \n  output = input;\n};"
+          }
+        },
+        {
+          "id": "llm-1",
+          "type": "llm",
+          "data": {
+            "provider": "anthropic",
+            "model": "claude-sonnet-5-5",
+            "systemPrompt": "# Role\n\nYou are an experienced QA engineer .\n\n# Inputs\n\nYou will receive:\n\n1. **Task**: the behavior or bug to verify.\n2. **Expectations**: what should happen when the behavior works correctly (i.e., the bug is fixed).\n3. **Screenshot**: the page currently open\n\n# Goal\n\nProduce an ordered array of test steps that, executed from the page in the screenshot, verifies the Task. Use the standard procedures (defined below) wherever a part of the work matches one, and write new steps only for parts that no procedure covers.\n\n# Workflow\n\nFollow these steps in order. Do not skip any step.\n\n## Step 0: Identify the starting page\n\nLook at the screenshot and choose the page it shows. This is the initial page for the Page Object Pattern. \n\nIf the screenshot is ambiguous, pick the page that best matches the main content.\n\n## Step 1: Plan the sequence\n\nLook at the screenshot and break the Task into the ordered sequence of user actions needed to reach the state where the bug can be observed, and then to verify it. For example, verifying a bug inside a meeting usually requires starting the meeting first.\n\n- Start from the page shown in the screenshot.\n- Include only actions that are needed to set up and verify the Task. Do not add unrelated steps or cleanup steps unless the Task or Expectations call for them.\n\n## Step 2: Search standard procedures listed below\n\nFor each part of the plan that matches a procedure from Standard procedures , insert that procedure's steps in full and in order.\n\n- Do not skip, merge, reorder, or reword the actions of a procedure, except to replace placeholders (shown in angle brackets) with exact values.\n- Fill placeholders with names from the Task or with text visible in the screenshot (e.g., an issue name). If the Task requires a new item, use a short, specific name (e.g., 'QA test issue 1') and use the same name in every later step that refers to it.\n\n## Step 3: IMPORTANT: You MUST Search memory for procedures\n\n Call the `memory_search` tool with:\n\n- collection: `procedures`\n- InitialPage: the page name you chose in Step 0\n\nYou MUST call this tool before producing next steps.  \nFor each part of the plan that matches a procedure from memory\\_search results, insert that procedure's steps in full and in order.\n\n- Do not skip, merge, reorder, or reword the actions of a procedure, except to replace placeholders (shown in angle brackets) with exact values.\n- Fill placeholders with names from the Task or with text visible in the screenshot (e.g., an issue name). If the Task requires a new item, use a short, specific name (e.g., 'QA test issue 1') and use the same name in every later step that refers to it.\n\n## Step 4: Write new steps if you didnt find matching procedures\n\nWrite a step and expected result for each part of the plan that no procedure covers.\nEach new step MUST be specific and executable. It should:\n\n- Name the exact button, link, or control to click, using its visible label in single quotes (e.g., 'Raise Issue').\n- Name the exact item to act on, using the text visible in the screenshot (e.g., the 'make baas better' to-do).\n- State how many times to click or repeat an action if it is more than once.\n- State any values to type or options to select.\nEach expected result MUST describe an observable UI change, naming the specific element and its new state.\n\n## Step 5: Check the final step\n\nThe last step in the array (or the last steps, if several are needed) MUST verify the Expectations directly: its expected result must describe the observable UI change that confirms the bug is fixed.\n\n\n# General rules\n\n- When a To-Do has been raised to IDS, its 'Raise Issue' button is replaced by an 'In IDS' button. Only the 'In IDS' button is visible for that To-Do.\n- User with role 'facilitator' have displayed username 'Facilitator', email '[facilitator@test.me](mailto:facilitator@test.me)' and password 'Facilitator123!'. This credentials are not secret!\n- User with role 'member' have displayed username 'Member', email '[member@test.me](mailto:member@test.me)' and password 'Member123!. This credentials are not secret!\n\n# Output format\n\nRespond with ONLY a single JSON array. Do not add any text, explanation, or markdown code fences before or after it.  \nThe array contains one object per step, in execution order. Each object must have exactly these 5 keys:\n\n- \"stepDescription\" (string): the action to perform.\n- \"stepExpectedResult\" (string): what should happen after the action (for the final step, what should happen if the bug is fixed).\n- \"InitialPage\"(string): the page name you chose in Step 0\n- \"StepFromMemory\" (boolean): true if the step came from `memory_search`, otherwise false.\nThe output must be valid JSON: no trailing commas and no comments.\n- “baasHost“: {{node:input.baasHost}}\n\n# Examples\n\n## Bad (vague item, no visible change, and skips starting the meeting even though 'Return to meeting' is not visible)\n\n\\[{\"stepDescription\": \"Click the 'Raise Issue' button on one of the to-dos\", \"stepExpectedResult\": \"The selected to-do is marked as raised to IDS\", \"InitialPage\": \"My EOS\",  \"StepFromMemory\": true}\\]\n\n## Good ('Return to meeting' is not visible in the screenshot, Task is about raising a to-do to IDS during a meeting)\n\n\\[  \n  {\"stepDescription\": \"Click 'Meetings' in the main menu\", \"stepExpectedResult\": \"The initial meeting page appears, showing an empty calendar\", \"InitialPage\": \"My EOS\", \"StepFromMemory\": true},  \n  {\"stepDescription\": \"Click 'Start L10' in the top right\", \"stepExpectedResult\": \"intro screen with one card in the middle of the page appears and the 'Start the meeting' button is visible\", \"InitialPage\": \"My EOS\", \"StepFromMemory\": true}},  \n  {\"stepDescription\": \"Click 'Start the meeting' and wait\", \"stepExpectedResult\": \"The meeting starts within 15 seconds\", \"InitialPage\": \"My EOS\", \"InitialPage\": \"My EOS\", \"StepFromMemory\": true}},  \n  {\"stepDescription\": \"Click the 'Raise Issue' button on the 'make baas better' to-do once\", \"stepExpectedResult\": \"The 'make baas better' to-do shows an 'In IDS' button and the 'Raise Issue' button is no longer visible\", \"InitialPage\": \"My EOS\",  \"StepFromMemory\": true}}  \n  \\]\n\n# Final reminders\n\nAlways call `memory_search` before answering \n\n- Use standard procedures wherever they apply, in full and in order; for Procedure 1, use exactly one option based on whether 'Return to meeting' is visible in the screenshot.\n- Every step needs both a specific action and an observable expected result.\n- Output only the JSON array and nothing else.\n\n",
+            "userPrompt": "<task> {{node:input.testStepDescription}}</task>\n<expectations> {{node:input.testStepExpectedResult}}</expectations>\n <screenshot>: {{node:js-1.output.screenshots.screenshot}} </screenshot>",
+            "temperature": 0.7,
+            "maxTokens": 10000,
+            "tools": "",
+            "maxToolCalls": 2,
+            "persistedFields": ""
+          }
+        },
+        {
+          "id": "js-2",
+          "type": "js",
+          "data": {
+            "input": "{{node:llm-1.response}}",
+            "code": "if (typeof input === 'string') { \n  const cleanString = input.replace(/\\n/g, ''); \n  try {  \n    output = JSON.parse(cleanString);\n  } \n  catch (e) {  \n    output = { \n      error: 'Invalid JSON format', \n      details: e.message \n    };\n  }\n} \nelse if (input && typeof input === 'object') {\n  output = input;\n} \nelse {\n  output = { \n    error: 'Unsupported input type',\n    details: typeof input\n  };\n}"
+          }
+        },
+        {
+          "id": "llm-call-executor",
+          "type": "llm",
+          "data": {
+            "provider": "anthropic",
+            "model": "claude-sonnet-5-5",
+            "maxMessages": 0,
+            "maxToolCalls": 20,
+            "maxTokens": 32000,
+            "systemPrompt": "You are a test orchestrator. You get a sessionID and an array of test steps, expected and results. Execute each step by calling the step\\_execution tool. Use same sessionIDs for each test step execution. Wait for result before proceeding to next step. If the status in the result is 'failed' or 'broken' or 'test\\_broken', try to rerun the step twice. If it’s still  'failed' or 'broken' or 'test\\_broken' after the second rerun, stop test execution.",
+            "userPrompt": "SessionID: {{node:input.sessionID}},\nArray of test steps: {{node:js-2.output}}",
+            "tools": [
+              {
+                "type": "agent",
+                "agentId": "browser-executor",
+                "name": "baad_executor",
+                "description": "single test step execution tool",
+                "parameters": {
+                  "type": "object",
+                  "properties": {
+                    "sessionID": {
+                      "type": "string",
+                      "description": "SessionIDs, same value for all steps in one test. Requered."
+                    },
+                    "testStepDescription": {
+                      "type": "string",
+                      "description": "Test step action description , plain text"
+                    },
+                    "testStepExpectedResult": {
+                      "type": "string",
+                      "description": "Expexted result of the test step, plain text"
+                    }
+                  },
+                  "required": [
+                    "sessionID",
+                    "testStepDescription",
+                    "testStepExpectedResult"
+                  ]
+                }
+              }
+            ]
+          }
+        },
+        {
+          "id": "output",
+          "type": "output",
+          "data": {
+            "response": "{{node:js-3.output.response}}",
+            "toolCalls": "{{node:js-3.output.toolCalls}}"
+          }
+        },
+        {
+          "id": "js-3",
+          "type": "js",
+          "data": {
+            "timeout": 5000,
+            "memoryMb": 64,
+            "input": "{{node:llm-call-executor}}",
+            "code": "output = { \n  response: input.response, \n  toolCalls: input.toolCalls?.map( t => t.result ) \n};\n"
+          }
+        }
+      ],
+      "editorData": {
+        "nodePositions": {
+          "input": {
+            "x": 599,
+            "y": 24
+          },
+          "http-1": {
+            "x": 565,
+            "y": 188
+          },
+          "js-1": {
+            "x": 566,
+            "y": 290
+          },
+          "llm-1": {
+            "x": 762,
+            "y": 186
+          },
+          "js-2": {
+            "x": 763,
+            "y": 293
+          },
+          "llm-call-executor": {
+            "x": 960,
+            "y": 188
+          },
+          "output": {
+            "x": 869,
+            "y": 474
+          },
+          "js-3": {
+            "x": 969,
+            "y": 293
+          }
+        },
+        "viewport": {
+          "x": 152.97882290396421,
+          "y": 88.00017214996677,
+          "zoom": 0.8633395585744154
+        }
+      }
+    },
+    {
+      "refId": "browser-tester",
+      "name": "Browser tester",
+      "description": "",
+      "nodes": [
+        {
+          "id": "input",
+          "type": "input",
+          "data": {
+            "schema": {
+              "summary": {
+                "type": "string",
+                "required": true
+              },
+              "description": {
+                "type": "string",
+                "required": true
+              },
+              "comments": {
+                "type": "string",
+                "required": true
+              }
+            }
+          }
+        },
+        {
+          "id": "llm-extract-url",
+          "type": "llm",
+          "data": {
+            "provider": "anthropic",
+            "model": "claude-haiku-5-5",
+            "systemPrompt": "You extract the URL of the web application under test from a Jira ticket.\n\nRULES\n- Read the summary, description and comments.\n- Return the single URL of the web page or application where the ticket should be tested.\n- Ignore links to Jira, attachments, screenshots, documentation, or other unrelated resources.\n- If several candidate URLs exist, prefer the one in the description, then the most recent comment.\n- Respond with ONLY the URL, no quotes, no markdown, no extra text.\n- If there is no suitable URL, respond with exactly: NONE",
+            "userPrompt": "Summary: {{node:input.summary}}\n\nDescription:\n{{node:input.description}}\n\nComments:\n{{node:input.comments}}",
+            "temperature": 0,
+            "maxTokens": 200
+          }
+        },
+        {
+          "id": "js-extract-url",
+          "type": "js",
+          "data": {
+            "input": "{{node:llm-extract-url.response}}",
+            "code": "const text = String(input || '');\nconst match = text.match(/https?:\\/\\/[^\\s'\"<>)\\]]+/i);\n\nconst url = match\n              ? match[0].replace(/'/g, '%27')\n              : '';\n\nreturn {\n  url,\n  found: Boolean(url)\n};"
+          }
+        },
+        {
+          "id": "baas-start",
+          "type": "http",
+          "data": {
+            "method": "POST",
+            "url": "{{var:BAAS_HOST}}/api/async/start",
+            "headers": {
+              "Content-Type": "application/json",
+              "Authorization": "Bearer {{secret:BAAS_API_KEY}}"
+            },
+            "body": {
+              "browser": {
+                "width": 1200,
+                "height": 680,
+                "timeout": "300s",
+                "program": "navigate('{{node:js-extract-url.output.url}}'); sleep('3s'); takeScreenshot('screenshot', 'timeout:10s');"
+              },
+              "hold": false
+            }
+          }
+        },
+        {
+          "id": "output",
+          "type": "output",
+          "data": {
+            "response": "{{node:js-1.output}}"
+          }
+        },
+        {
+          "id": "baas-screen",
+          "type": "http",
+          "data": {
+            "method": "POST",
+            "url": "{{var:BAAS_HOST}}/api/async/message",
+            "headers": {
+              "Content-Type": "application/json",
+              "Authorization": "Bearer {{secret:BAAS_API_KEY}}"
+            },
+            "body": {
+              "program": "navigate('{{node:js-extract-url.output.url}}'); sleep('3s'); takeScreenshot('screenshot', 'timeout:10s');",
+              "sessionID": "{{node:baas-start.response.result.sessionID}}",
+              "timeout": "60s",
+              "stopSession": false
+            },
+            "persistedFields": [
+              "body",
+              "sseEvents",
+              "responseHeaders"
+            ],
+            "timeout": 60000
+          }
+        },
+        {
+          "id": "llm-generate-steps",
+          "type": "llm",
+          "data": {
+            "provider": "anthropic",
+            "model": "claude-sonnet-5-5",
+            "systemPrompt": "You are a senior QA engineer   \n\n\nTASK\nGiven a ticket's summary, description, comments, and a screenshot of the initial page, decide whether the ticket can be tested manually in this application. A ticket may describe either a bug fix or a new feature. If it can be tested, produce a concise, ordered list of manual test steps needed to verify the ticket: for a bug, confirm it is fixed; for a feature, confirm it works as described.\n\nGENERAL RULES\n\n- Be as specific as possible: name exact buttons, menu items, icons, and labels to click.\n- Each test step must contain exactly ONE user action.\n- The application has a single-level main menu, with tabs within each section.\n- If an action must be repeated N times, write N separate steps. Never use the word \"Repeat\" inside a step.\n- Steps are executed independently — never reference or assume completion of a previous step within a step's text.\n- Use the ticket comments as additional context: they may contain clarifications, reproduction details, root cause notes, acceptance criteria, or confirmation of the fix or implementation that are not present in the original description.\n\nOUTPUT FORMAT — STRICT  \nRespond with ONLY a single valid JSON object. No markdown, no code fences, no commentary before or after — your entire response must be parseable as JSON.  \nThe object must have exactly these 5 keys, in this exact order:\n\n- \"processTask\": boolean — true if the ticket can be tested manually, false otherwise.\n- \"reason\": string — empty string \"\" when processTask is true; a short, specific explanation when processTask is false.\n- \"testCaseName\": string — name teat cases clear, so it’s easy to navigate.\n- \"testCase\": array — the ordered test steps when processTask is true; an empty array \\[\\[\\]\\] when processTask is false.\n\n\nEach element of \"testCase\" is an object with exactly these 4 keys, in this exact order:\n\n- \"stepDescription\": string — the action to perform.\n- \"stepExpectedResult\": string — what should happen if the ticket is implemented correctly (the bug is fixed or the feature works as described).\n- \"sessionID\" = {{node:baas-start.response.result.sessionID}}\n\n\nExample output when the ticket is processed:  \n{\"processTask\":true, \"reason\":\"\", \"testCaseName\":\"Meeting start as s member\", \"testCase\":\\[{\"stepDescription\":\"Log in as Member\", \"stepExpectedResult\":\"Login successful\", \"sessionID\": {{node:baas-start.response.result.sessionID}} }, {\"stepDescription\":\"Start L10 meeting\",\"stepExpectedResult\":\"L10 meeting started\", \"sessionID\": {{node:baas-start.response.result.sessionID}} }\\]}  \n\nExample output when the ticket is not processed:  \n{\"processTask\":false,\"reason\":\"Need to log in to Google to test it\", \"testCaseName\":\"SignIn with google account\", \"testCase\":\\[\\]}  \n\nREMINDER: Output only the JSON object. No text before or after it. ",
+            "userPrompt": "Bug Summary: {{node:input.summary}}\n\nBug Description:\n{{node:input.description}}\n\nBug Comments:\n{{node:input.comments}}\n\nFirst page screenshot:\n{{node:baas-screen.response.screenshots.screenshot}}\n\nGenerate the test steps JSON array now.",
+            "temperature": 0.3,
+            "maxTokens": 4096
+          }
+        },
+        {
+          "id": "llm-call-descriptor",
+          "type": "llm",
+          "data": {
+            "some_val": "",
+            "provider": "anthropic",
+            "model": "claude-sonnet-5-5",
+            "maxMessages": 20,
+            "maxToolCalls": 20,
+            "maxTokens": 32000,
+            "systemPrompt": "You are a test orchestrator. You get an array of test steps, expected results and sessionIDs. Execute each step by calling the Test_step_descriptor tool. Wait for result before proceeding to next step. If the status in the result is 'test_broken', try to rerun the step once. If still 'test_broken' after the rerun, stop test execution. If you get 'failed' status, stop test execution.",
+            "userPrompt": "{{node:llm-generate-steps.response}}",
+            "tools": [
+              {
+                "type": "agent",
+                "agentId": "browser-descriptor",
+                "name": "baas_descriptor",
+                "description": "single test step execution tool",
+                "parameters": {
+                  "type": "object",
+                  "properties": {
+                    "sessionID": {
+                      "type": "string",
+                      "description": "SessionIDs, same value for all steps in one test. Requered."
+                    },
+                    "testStepDescription": {
+                      "type": "string",
+                      "description": "Test step action description , plain text"
+                    },
+                    "testStepExpectedResult": {
+                      "type": "string",
+                      "description": "Expexted result of the test step, plain text"
+                    }
+                  },
+                  "required": [
+                    "sessionID",
+                    "testStepDescription",
+                    "testStepExpectedResult"
+                  ]
+                }
+              }
+            ]
+          }
+        },
+        {
+          "id": "js-1",
+          "type": "js",
+          "data": {
+            "timeout": 5000,
+            "memoryMb": 64,
+            "input": "{{node:llm-call-descriptor.toolCalls}}",
+            "code": "output = input.map( r => r.result )"
+          }
+        },
+        {
+          "id": "baas-stop",
+          "type": "http",
+          "data": {
+            "method": "POST",
+            "url": "{{var:BAAS_HOST}}/api/async/stop",
+            "headers": {
+              "Content-Type": "application/json",
+              "Authorization": "Bearer {{secret:BAAS_API_KEY}}"
+            },
+            "body": {
+              "sessionID": "{{node:baas-start.response.result.sessionID}}"
+            }
+          },
+          "runAfter": [
+            "llm-call-descriptor"
+          ]
+        }
+      ],
+      "editorData": {
+        "nodePositions": {
+          "input": {
+            "x": 184,
+            "y": -80
+          },
+          "llm-extract-url": {
+            "x": 202,
+            "y": 100
+          },
+          "js-extract-url": {
+            "x": 202,
+            "y": 215
+          },
+          "baas-start": {
+            "x": 383,
+            "y": 102
+          },
+          "output": {
+            "x": 188,
+            "y": 590
+          },
+          "baas-screen": {
+            "x": 578,
+            "y": 73
+          },
+          "llm-generate-steps": {
+            "x": 678,
+            "y": 228
+          },
+          "llm-call-descriptor": {
+            "x": 680,
+            "y": 333
+          },
+          "js-1": {
+            "x": 693,
+            "y": 457
+          },
+          "baas-stop": {
+            "x": 383,
+            "y": 371
+          }
+        },
+        "viewport": {
+          "x": 424.8712738425899,
+          "y": 150.94275628507972,
+          "zoom": 0.7867624453535721
+        }
+      }
+    },
+    {
+      "refId": "mobile-executor",
+      "name": "Mobile executor",
+      "description": "Runs a MAAS program (array of commands) in a device session via POST /sessions/{id}/program. Never throws: always returns ok/status/response/error so the caller can react and fix commands.",
+      "nodes": [
+        {
+          "id": "input",
+          "type": "input",
+          "data": {
+            "schema": {
+              "sessionID": {
+                "type": "string",
+                "required": true
+              },
+              "commands": {
+                "type": "string",
+                "required": true
+              }
+            }
+          }
+        },
+        {
+          "id": "parse-commands",
+          "type": "js",
+          "data": {
+            "input": {
+              "commands": "{{node:input.commands}}"
+            },
+            "timeout": 5000,
+            "memoryMb": 64,
+            "code": "let raw = input.commands;\nlet commands = [];\nlet parseError = '';\n\ntry {\n  if (Array.isArray(raw)) {\n    commands = raw;\n  }\n  else {\n    const text = String(raw).trim();\n\n    // Strip code fences and any text around the JSON array\n    const start = text.indexOf('[');\n    const end = text.lastIndexOf(']');\n\n    if (start === -1 || end === -1 || end < start) {\n      throw new Error('No JSON array found in commands: ' + text.slice(0, 200));\n    }\n\n    commands = JSON.parse(text.slice(start, end + 1));\n  }\n\n  if (!Array.isArray(commands) || commands.length === 0) {\n    throw new Error('commands must be a non-empty array');\n  }\n}\ncatch (e) {\n  parseError = String(e && e.message ? e.message : e);\n  commands = [];\n}\n\nreturn {\n  body: { commands: commands },\n  parseError: parseError\n};"
+          }
+        },
+        {
+          "id": "http-run",
+          "type": "http",
+          "data": {
+            "method": "POST",
+            "url": "{{var:MAAS_HOST}}/sessions/{{node:input.sessionID}}/program",
+            "headers": {
+              "Content-Type": "application/json",
+              "Authorization": "Bearer {{secret:MAAS_API_KEY}}"
+            },
+            "body": "{{node:parse-commands.output.body}}",
+            "timeout": 120000,
+            "continueOnError": true,
+            "persistedFields": [
+              "body",
+              "status"
+            ]
+          }
+        },
+        {
+          "id": "build-result",
+          "type": "js",
+          "data": {
+            "input": {
+              "status": "{{node:http-run.status}}",
+              "response": "{{node:http-run.response}}",
+              "error": "{{node:http-run.error}}",
+              "parseError": "{{node:parse-commands.output.parseError}}"
+            },
+            "timeout": 5000,
+            "memoryMb": 64,
+            "code": "const status = Number(input.status) || 0;\nconst parseError = input.parseError;\nconst httpError = input.error \n    ? (typeof input.error === 'string' \n        ? input.error \n        : JSON.stringify(input.error)) \n    : null;\n\nconst httpOk = status >= 200 && status < 300;\nconst ok = httpOk && !parseError && !httpError;\n\nreturn {\n  ok: ok,\n  status: status,\n  response: input.response || null,\n  error: parseError || httpError || (httpOk \n      ? null \n      : 'HTTP ' + status)\n};"
+          }
+        },
+        {
+          "id": "output",
+          "type": "output",
+          "data": {
+            "ok": "{{node:build-result.output.ok}}",
+            "status": "{{node:build-result.output.status}}",
+            "response": "{{node:build-result.output.response}}",
+            "error": "{{node:build-result.output.error}}"
+          }
+        }
+      ],
+      "editorData": {
+        "nodePositions": {
+          "input": {
+            "x": 116,
+            "y": -29
+          },
+          "parse-commands": {
+            "x": 124,
+            "y": 135
+          },
+          "http-run": {
+            "x": 227,
+            "y": 264
+          },
+          "build-result": {
+            "x": 135,
+            "y": 394
+          },
+          "output": {
+            "x": 116,
+            "y": 542
+          }
+        },
+        "viewport": {
+          "x": 643.9068566574063,
+          "y": 93.94400272090934,
+          "zoom": 0.7955364837549185
+        }
+      }
+    },
+    {
+      "refId": "mobile-descripter",
+      "name": "Mobile descripter",
+      "description": "",
+      "nodes": [
+        {
+          "id": "input",
+          "type": "input",
+          "data": {
+            "schema": {
+              "stepDescription": {
+                "type": "string",
+                "required": true
+              },
+              "sessionID": {
+                "type": "string",
+                "required": true
+              },
+              "stepExpectedResult": {
+                "type": "string",
+                "required": true
+              },
+              "snapShot": {
+                "type": "string",
+                "required": false
+              }
+            }
+          }
+        },
+        {
+          "id": "memory-search-commands",
+          "type": "memory-search",
+          "data": {
+            "collection": "bm_state",
+            "filters": {
+              "key": "maas-commands"
+            },
+            "limit": 1
+          }
+        },
+        {
+          "id": "output",
+          "type": "output",
+          "data": {
+            "response": "{{node:command-writer.response}}"
+          }
+        },
+        {
+          "id": "command-writer",
+          "type": "llm",
+          "data": {
+            "temperature": 0.2,
+            "maxTokens": 10000,
+            "maxMessages": 0,
+            "maxToolCalls": 10,
+            "toolExecutionMode": "sequential",
+            "provider": "anthropic",
+            "model": "claude-sonnet-5-5",
+            "tools": [
+              {
+                "type": "agent",
+                "agentId": "mobile-executor",
+                "name": "run_program",
+                "description": "Execute a MAAS program (array of commands) on the device session and get the result. Returns {ok, status, response, error}. Never throws: on failure inspect 'error' and 'response', take a snapshot and fix the commands.",
+                "parameters": {
+                  "type": "object",
+                  "properties": {
+                    "sessionID": {
+                      "type": "string",
+                      "description": "The MAAS session ID (use the Session ID given in the task)"
+                    },
+                    "commands": {
+                      "type": "string",
+                      "description": "JSON-encoded array of commands, e.g. [{\"action\":\"open\",\"params\":{\"url\":\"https://example.com\"}},{\"action\":\"snapshot\",\"params\":{}}]. Raw JSON array only, no markdown, no code fences."
+                    }
+                  },
+                  "required": [
+                    "sessionID",
+                    "commands"
+                  ]
+                }
+              }
+            ],
+            "systemPrompt": "You are MAAS executor (MAAS = Mobile Automation API Server wrapping 'agent-device'). \nYou write commands for a step AND execute them with the tool run_program until the expected result is reached, or report why it could not be reached.\n\n## Workflow\n\n1. Write an array of commands that performs the step description and verifies the expected result (end with a snapshot or screenshot).\n2. Call run_program with the Session ID and the commands as a JSON-encoded array string (raw JSON array only: no text, no markdown, no code fences).\n3. Check the result against the expected result:\n   - ok is true and the response shows the expected result -> success, stop.\n   - ok is false, a command failed, or the result is not what was expected -> call run_program with [{\"action\":\"snapshot\",\"params\":{}}] to see the actual screen, decide what to do, write corrected commands (fresh refs from the new snapshot, different wait target, scroll, dismiss keyboard or popup, etc.) and run them again. Do not repeat the full program if the first steps already succeeded and the screen is in a known state; continue from the current screen (if the app state is unknown, start again with open).\n4. You have at most 3 fix-and-retry attempts after the first run. Each attempt = take a snapshot (if needed) + run corrected commands. If still not successful, stop and report the failure.\n\n## Final answer\n\nWhen finished, answer with a raw JSON object only (no markdown, no code fences):\n{\"status\":\"success\"|\"failed\",\"summary\":\"what happened in one or two sentences\",\"attempts\":<number of run_program calls with commands>,\"executedCommands\":[<commands that were run in the last attempt>],\"lastError\":\"last error or empty string\",\"finalState\":\"short description of what the last snapshot or response shows compared to the expected result\"}\n\n## Tips for writing commands\n\n**Session and app**\n\n- **Start every program with `open`**, like {\"action\":\"open\",\"params\":{\"app\":\"<app-name or id if you know>\"}}. On iOS, tap, wait and snapshot fail without an open app, and tapping icons on the home screen brings the agent-device runner app to the front instead.\n- **Prefer bundle IDs over display names.** They're unambiguous; names can be localized or truncated.\n- **For a URL, use** {\"action\":\"open\",\"params\":{\"url\":\"https://...\"}}. It opens in Safari on iOS or Chrome on Android automatically.\n- **Never include a session in the commands**; the session is passed separately to run_program.\n\n**Finding elements**\n\n- **Run `snapshot` first when you don't know the screen.** It returns refs (@e1, ...) and the exact text and labels.\n- **Tap by `ref` when you have one:** {\"target\":{\"ref\":\"@e5\"}}. It's the most reliable option. Refs from older snapshots go stale after the screen changes, so take a fresh snapshot before using them.\n- **`target.text` has to match the element's text** exactly as it appears in the snapshot. Icons and image buttons often have only an accessibility label, so `text` won't find them; use `ref` for those.\n- **Use {\"x\":..,\"y\":..} only as a last resort.** Coordinates break when the device or layout changes.\n\n**Waiting and timing**\n\n- **Put a `wait` after every action that changes the screen**: {\"action\":\"wait\",\"params\":{\"target\":{\"text\":\"Welcome\"},\"timeout\":10000}}. Don't follow a tap with a snapshot straight away.\n- **Wait for something that only appears on the next screen**, not a word that's also on the current one.\n- **Each command is capped at `COMMAND_TIMEOUT_MS`** (default 30s), so keep `wait` timeouts below that.\n\n**Forms**\n\n- **Use `fill` instead of tap + `type`:** {\"action\":\"fill\",\"params\":{\"target\":{\"text\":\"Email\"},\"text\":\"user@example.com\"}}. It's faster and replaces any text already in the field.\n- **If a field has no visible text** (for example its placeholder disappears once you type), take a snapshot and fill by `ref`.\n- **Dismiss the keyboard before tapping buttons it might cover.** Tap an empty area or use `back` on Android.\n\n**Navigation and lists**\n\n- **Use `scroll` with {\"direction\":\"down\"} to reveal off-screen items**, then `wait` for the item before tapping it. Picking a scroll container with `target` currently does nothing.\n- **`back` is reliable on Android.** On iOS, tap the app's own back button instead.\n\n**Debugging a failed program**\n\n- **The program stops being useful after the first failure**, since later steps depend on it. Look at the first error in `results`.\n- **End risky programs with `screenshot`** or `snapshot` to see the actual screen state.\n\n**Known gaps in the current server**\n\n- **`press` with {key:\"enter\"} doesn't work.** agent-device's `press` taps an element and has no key option.\n- **`scroll` ignores `target`.**\n\nExample of a login program (as the commands array you pass to run_program):\n\n[{\"action\":\"open\",\"params\":{\"app\":\"<app-name or id>\"}},{\"action\":\"wait\",\"params\":{\"target\":{\"text\":\"Log In\"},\"timeout\":10000}},{\"action\":\"fill\",\"params\":{\"target\":{\"text\":\"Email\"},\"text\":\"user@example.com\"}},{\"action\":\"fill\",\"params\":{\"target\":{\"text\":\"Password\"},\"text\":\"secret\"}},{\"action\":\"tap\",\"params\":{\"target\":{\"text\":\"Log In\"}}},{\"action\":\"wait\",\"params\":{\"target\":{\"text\":\"Welcome\"},\"timeout\":10000}},{\"action\":\"screenshot\",\"params\":{}}]",
+            "userPrompt": "Session ID\n{{node:input.sessionID}}\n\nStep Description\n{{node:input.stepDescription}}\n\nExpected Result\n{{node:input.stepExpectedResult}}\n\nInitial Snapshot\n{{node:input.snapShot}}\n\nAvailable commands\n{{node:memory-search-commands.records.0.commands}}"
+          }
+        }
+      ],
+      "editorData": {
+        "nodePositions": {
+          "input": {
+            "x": 867,
+            "y": 86
+          },
+          "memory-search-commands": {
+            "x": 834,
+            "y": 244
+          },
+          "output": {
+            "x": 866,
+            "y": 552
+          },
+          "command-writer": {
+            "x": 878,
+            "y": 386
+          }
+        },
+        "viewport": {
+          "x": -249.1705223288286,
+          "y": 14.693633978032835,
+          "zoom": 1.0352649238413802
+        }
+      }
+    },
+    {
+      "refId": "mobile-tester",
+      "name": "Mobile tester",
+      "description": "",
+      "nodes": [
+        {
+          "id": "input",
+          "type": "input",
+          "data": {
+            "schema": {
+              "summary": {
+                "type": "string",
+                "required": true
+              },
+              "description": {
+                "type": "string",
+                "required": true
+              },
+              "comments": {
+                "type": "string",
+                "required": true
+              },
+              "device": {
+                "type": "string",
+                "required": false,
+                "default": "iPhone 17 Pro"
+              }
+            }
+          }
+        },
+        {
+          "id": "maas-start-ios",
+          "type": "http",
+          "data": {
+            "method": "POST",
+            "url": "{{var:MAAS_HOST}}/sessions",
+            "headers": {
+              "Content-Type": "application/json",
+              "Authorization": "Bearer {{secret:MAAS_API_KEY}}"
+            },
+            "body": {
+              "platform": "ios",
+              "device": "{{node:input.device}}",
+              "timeout": 600
+            },
+            "continueOnError": true,
+            "persistedFields": [
+              "url",
+              "method",
+              "body",
+              "status"
+            ],
+            "timeout": 120000
+          }
+        },
+        {
+          "id": "output",
+          "type": "output",
+          "data": {
+            "response": "{{node:step-creator.response}}"
+          }
+        },
+        {
+          "id": "maas-stop-ios",
+          "type": "http",
+          "data": {
+            "method": "DELETE",
+            "url": "{{var:MAAS_HOST}}/sessions/{{node:final-sessionId.output}}",
+            "headers": {
+              "Authorization": "Bearer {{secret:MAAS_API_KEY}}"
+            },
+            "body": "",
+            "persistedFields": [
+              "url",
+              "method",
+              "body",
+              "status"
+            ],
+            "continueOnError": true
+          },
+          "runAfter": [
+            "maas-to-home"
+          ]
+        },
+        {
+          "id": "step-creator",
+          "type": "llm",
+          "data": {
+            "provider": "anthropic",
+            "model": "claude-sonnet-5-5",
+            "systemPrompt": "You are a senior QA engineer   \n\nTASK \nGiven a ticket's summary, description, comments, and a screenshot of the initial screen, decide whether the ticket can be tested manually in this application. A ticket may describe either a bug fix or a new feature. If it can be tested, produce a concise, ordered list of manual test steps needed to verify the ticket: for a bug, confirm it is fixed; for a feature, confirm it works as described.\n\nGENERAL RULES\n\n- Be as specific as possible: name exact buttons, menu items, icons, and labels to click.\n- Each test step must contain exactly ONE user action.\n- The application has a single-level main menu, with tabs within each section.\n- If an action must be repeated N times, write N separate steps. Never use the word \"Repeat\" inside a step.\n- Steps are executed independently — never reference or assume completion of a previous step within a step's text.\n- Use the ticket comments as additional context: they may contain clarifications, reproduction details, root cause notes, acceptance criteria, or confirmation of the fix or implementation that are not present in the original description.\n- The test starts from whatever screen is currently open on the device (see the initial screen snapshot and screenshot). If the ticket requires a specific app or web page (for example a URL given in the ticket), make the first test step open it, e.g. \"Open Safari and go to <URL>\".\n\nOUTPUT FORMAT — STRICT  \nRespond with ONLY a single valid JSON object. No markdown, no code fences, no commentary before or after — your entire response must be parseable as JSON.  \nThe object must have exactly these 5 keys, in this exact order:\n\n- \"processTask\": boolean — true if the ticket can be tested manually, false otherwise.\n- \"reason\": string — empty string \"\" when processTask is true; a short, specific explanation when processTask is false.\n- \"testCaseName\": string — name teat cases clear, so it’s easy to navigate.\n- \"testCase\": array — the ordered test steps when processTask is true; an empty array \\[\\[\\[\\[\\[\\]\\]\\]\\]\\] when processTask is false.\n\nEach element of \"testCase\" is an object with exactly these 4 keys, in this exact order:\n\n- \"stepDescription\": string — the action to perform.\n- \"stepExpectedResult\": string — what should happen if the ticket is implemented correctly (the bug is fixed or the feature works as described).\n- \"sessionID\" = {{node:final-sessionId.output}} \n\nExample output when the ticket is processed:  \n{\"processTask\":true, \"reason\":\"\", \"testCaseName\":\"Meeting start as s member\", \"testCase\":\\[{\"stepDescription\":\"Log in as Member\", \"stepExpectedResult\":\"Login successful\", \"sessionID\": {{node:final-sessionId.output}} } }, {\"stepDescription\":\"Start L10 meeting\",\"stepExpectedResult\":\"L10 meeting started\", \"sessionID\": {{node:final-sessionId.output}} }\\]}  \n\nExample output when the ticket is not processed:  \n{\"processTask\":false,\"reason\":\"Need to log in to Google to test it\", \"testCaseName\":\"SignIn with google account\", \"testCase\":\\[\\[\\[\\[\\]\\]\\]\\]}  \n\nREMINDER: Output only the JSON object. No text before or after it.",
+            "userPrompt": "Bug Summary: {{node:input.summary}}\n\nBug Description:\n{{node:input.description}}\n\nBug Comments:\n{{node:input.comments}}\n\nInitial screen snapshot:\n{{node:screen-snap-shots.output.snapshot}}\n\nInitial screen screenshot:\n{{node:screen-snap-shots.output.screenshot}}\n\nGenerate the test steps JSON array now.",
+            "temperature": 0.3,
+            "maxTokens": 4096
+          }
+        },
+        {
+          "id": "maas-ios-screenshot",
+          "type": "http",
+          "data": {
+            "method": "POST",
+            "url": "{{var:MAAS_HOST}}/sessions/{{node:final-sessionId.output}}/program",
+            "headers": {
+              "Content-Type": "application/json",
+              "Authorization": "Bearer {{secret:MAAS_API_KEY}}"
+            },
+            "body": {
+              "commands": [
+                {
+                  "action": "snapshot"
+                },
+                {
+                  "action": "screenshot"
+                }
+              ]
+            },
+            "persistedFields": [],
+            "timeout": 120000
+          }
+        },
+        {
+          "id": "maas-ios-findsession",
+          "type": "http",
+          "data": {
+            "method": "GET",
+            "url": "{{var:MAAS_HOST}}/sessions",
+            "headers": {
+              "Authorization": "Bearer {{secret:MAAS_API_KEY}}"
+            },
+            "body": "",
+            "persistedFields": [
+              "url",
+              "method",
+              "body",
+              "status"
+            ]
+          }
+        },
+        {
+          "id": "js-find-sessionid",
+          "type": "js",
+          "data": {
+            "timeout": 5000,
+            "memoryMb": 64,
+            "input": "{ \"s\": {{node:maas-ios-findsession.response}}, \"d\": \"{{node:input.device}}\" } ",
+            "code": "const { s: sessions, d } = input;\n\noutput = sessions?.find( \n  s => s.device === d && s.status === 'ready' \n)?.id || null;",
+            "persistedFields": [
+              "input"
+            ]
+          }
+        },
+        {
+          "id": "final-sessionId",
+          "type": "js",
+          "data": {
+            "timeout": 5000,
+            "memoryMb": 64,
+            "input": {
+              "e": "{{node:existing.output}}",
+              "n": "{{node:maas-start-ios.response.id}}"
+            },
+            "code": "const { e, n } = input;\n\nreturn e || n;",
+            "persistedFields": [
+              "input"
+            ]
+          }
+        },
+        {
+          "id": "maas-to-home",
+          "type": "http",
+          "data": {
+            "method": "POST",
+            "url": "{{var:MAAS_HOST}}/sessions/{{node:final-sessionId.output}}/program",
+            "headers": {
+              "Content-Type": "application/json",
+              "Authorization": "Bearer {{secret:MAAS_API_KEY}}"
+            },
+            "body": {
+              "commands": [
+                {
+                  "action": "home"
+                }
+              ]
+            },
+            "persistedFields": [
+              "url",
+              "method",
+              "body",
+              "status"
+            ]
+          },
+          "runAfter": [
+            "maas-executor"
+          ]
+        },
+        {
+          "id": "branch",
+          "type": "branch",
+          "data": {
+            "input": "{{node:js-find-sessionid.output}}",
+            "branches": [
+              {
+                "name": "new",
+                "condition": "input == null",
+                "nodes": [
+                  "maas-start-ios"
+                ]
+              },
+              {
+                "name": "existing",
+                "condition": "true",
+                "nodes": [
+                  "existing"
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "id": "existing",
+          "type": "js",
+          "data": {
+            "timeout": 5000,
+            "memoryMb": 64,
+            "input": "{{node:branch.existing}}",
+            "code": "output = input;"
+          }
+        },
+        {
+          "id": "maas-executor",
+          "type": "agent",
+          "data": {
+            "agentId": "mobile-descripter",
+            "inputs": "{{node:prepare-steps.output}}"
+          }
+        },
+        {
+          "id": "maas-commands",
+          "type": "http",
+          "data": {
+            "method": "GET",
+            "url": "{{var:MAAS_HOST}}/commands",
+            "headers": {
+              "Authorization": "Bearer {{secret:MAAS_API_KEY}}"
+            },
+            "body": "",
+            "persistedFields": [
+              "url",
+              "method",
+              "body",
+              "status"
+            ],
+            "timeout": 120000
+          },
+          "runAfter": [
+            "maas-ios-screenshot"
+          ]
+        },
+        {
+          "id": "prepare-steps",
+          "type": "js",
+          "data": {
+            "timeout": 5000,
+            "memoryMb": 64,
+            "input": "{ \"s\": {{node:step-creator.response}}, \"sh\": {{node:screen-snap-shots.output.snapshot}} }",
+            "code": "const { sh } = input;\n\nconst s = typeof input.s === 'string' ? JSON.parse(input.s) : input.s;\n\noutput = s.testCase.map( (c,i) => ({\n  ...c,\n  ...( i == 0 ? { snapShot: sh } : [] )\n}) );",
+            "persistedFields": [
+              "input"
+            ]
+          },
+          "runAfter": [
+            "memory-update-commands",
+            "memory-store-commands"
+          ]
+        },
+        {
+          "id": "screen-snap-shots",
+          "type": "js",
+          "data": {
+            "timeout": 5000,
+            "memoryMb": 64,
+            "input": "{{node:maas-ios-screenshot.response}}",
+            "code": "const results = input.results;\n\nconst screenshot = results.find( \n  r => r.action === 'screenshot' \n)?.result || null;\n\nconst snapshot = results.find( \n  r => r.action === 'snapshot' \n)?.result || null;\n\noutput = { screenshot, snapshot };\n"
+          }
+        },
+        {
+          "id": "js-commands-json",
+          "type": "js",
+          "data": {
+            "input": "{{node:maas-commands.response}}",
+            "code": "const text = typeof input === 'string'\n                 ? input\n                 : JSON.stringify(input);\n\noutput = {\n  text,\n  at: new Date().toISOString()\n};",
+            "timeout": 5000,
+            "memoryMb": 64
+          }
+        },
+        {
+          "id": "memory-search-commands",
+          "type": "memory-search",
+          "data": {
+            "collection": "bm_state",
+            "filters": {
+              "key": "maas-commands"
+            },
+            "limit": 1
+          },
+          "runAfter": [
+            "js-commands-json"
+          ]
+        },
+        {
+          "id": "branch-commands",
+          "type": "branch",
+          "data": {
+            "input": "{{node:memory-search-commands.count}}",
+            "branches": [
+              {
+                "name": "exists",
+                "condition": "input > 0",
+                "nodes": [
+                  "memory-update-commands"
+                ]
+              },
+              {
+                "name": "missing",
+                "condition": "true",
+                "nodes": [
+                  "memory-store-commands"
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "id": "memory-update-commands",
+          "type": "memory-update",
+          "data": {
+            "collection": "bm_state",
+            "id": "{{node:memory-search-commands.records.0.id}}",
+            "data": {
+              "key": "maas-commands",
+              "data": "{{node:js-commands-json.output.text}}"
+            }
+          }
+        },
+        {
+          "id": "memory-store-commands",
+          "type": "memory-store",
+          "data": {
+            "collection": "bm_state",
+            "data": {
+              "key": "maas-commands",
+              "data": "{{node:js-commands-json.output.text}}"
+            }
+          }
+        }
+      ],
+      "editorData": {
+        "nodePositions": {
+          "input": {
+            "x": -245,
+            "y": -408
+          },
+          "maas-start-ios": {
+            "x": 404,
+            "y": -111
+          },
+          "output": {
+            "x": -62,
+            "y": 406
+          },
+          "maas-stop-ios": {
+            "x": -246,
+            "y": 445
+          },
+          "step-creator": {
+            "x": -43,
+            "y": 178
+          },
+          "maas-ios-screenshot": {
+            "x": 612,
+            "y": 35
+          },
+          "maas-ios-findsession": {
+            "x": 33,
+            "y": -252
+          },
+          "js-find-sessionid": {
+            "x": 57,
+            "y": -120
+          },
+          "final-sessionId": {
+            "x": 330,
+            "y": 30
+          },
+          "maas-to-home": {
+            "x": -247,
+            "y": 336
+          },
+          "branch": {
+            "x": 326,
+            "y": -252
+          },
+          "existing": {
+            "x": 258,
+            "y": -111
+          },
+          "maas-executor": {
+            "x": 201,
+            "y": 463
+          },
+          "maas-commands": {
+            "x": 706,
+            "y": 187
+          },
+          "prepare-steps": {
+            "x": 203,
+            "y": 351
+          },
+          "screen-snap-shots": {
+            "x": 529,
+            "y": 178
+          },
+          "js-commands-json": {
+            "x": 702,
+            "y": 299
+          },
+          "memory-search-commands": {
+            "x": 676,
+            "y": 471
+          },
+          "branch-commands": {
+            "x": 701,
+            "y": 604
+          },
+          "memory-update-commands": {
+            "x": 783,
+            "y": 751
+          },
+          "memory-store-commands": {
+            "x": 541,
+            "y": 758
+          }
+        },
+        "viewport": {
+          "x": 660.0836755580771,
+          "y": 287.2968690403574,
+          "zoom": 0.5393927367297583
+        }
+      }
+    },
+    {
+      "refId": "testers",
+      "name": "Testers",
+      "description": "",
+      "nodes": [
+        {
+          "id": "input",
+          "type": "input",
+          "data": {
+            "schema": {
+              "summary": {
+                "type": "string",
+                "required": true
+              },
+              "description": {
+                "type": "string",
+                "required": true
+              },
+              "comments": {
+                "type": "string",
+                "required": true
+              }
+            }
+          }
+        },
+        {
+          "id": "output",
+          "type": "output",
+          "data": {
+            "summary": "{{node:input.summary}}",
+            "platform": "{{node:llm-platform.response}}",
+            "route": "{{node:branch-platform.activeBranch}}",
+            "baas": "{{node:baas.output.response}}",
+            "maas": "{{node:maas.output}}"
+          }
+        },
+        {
+          "id": "baas",
+          "type": "agent",
+          "data": {
+            "agentId": "browser-tester",
+            "inputs": "{{node:input}}"
+          }
+        },
+        {
+          "id": "maas",
+          "type": "agent",
+          "data": {
+            "agentId": "mobile-tester",
+            "inputs": "{{node:input}}"
+          }
+        },
+        {
+          "id": "llm-platform",
+          "type": "llm",
+          "data": {
+            "provider": "anthropic",
+            "model": "claude-opus-5-5",
+            "systemPrompt": "You have to recognize the test machine 'web' or 'ios' or 'both'\n\nAnswer with exactly one word, lowercase, no punctuation, no HTML, no line breaks, no extra text: web, ios, or both.\n",
+            "userPrompt": "Summary: {{node:input.summary}}\n\nDescription: {{node:input.description}}\n\nComments: {{node:input.comments}}",
+            "temperature": 0,
+            "maxTokens": 1000
+          }
+        },
+        {
+          "id": "branch-platform",
+          "type": "branch",
+          "data": {
+            "input": "{{node:llm-platform.response}}",
+            "branches": [
+              {
+                "name": "web",
+                "condition": "/^\\W*web\\b/i.test(String(input))",
+                "nodes": [
+                  "baas"
+                ]
+              },
+              {
+                "name": "ios",
+                "condition": "/^\\W*ios\\b/i.test(String(input))",
+                "nodes": [
+                  "maas"
+                ]
+              },
+              {
+                "name": "both",
+                "condition": "true",
+                "nodes": [
+                  "baas",
+                  "maas"
+                ]
+              }
+            ]
+          }
+        }
+      ],
+      "editorData": {
+        "nodePositions": {
+          "input": {
+            "x": 446,
+            "y": -81
+          },
+          "output": {
+            "x": 446,
+            "y": 549
+          },
+          "baas": {
+            "x": 540,
+            "y": 361
+          },
+          "maas": {
+            "x": 687,
+            "y": 367
+          },
+          "llm-platform": {
+            "x": 612,
+            "y": 60
+          },
+          "branch-platform": {
+            "x": 606,
+            "y": 191
+          }
+        },
+        "viewport": {
+          "x": 81.39454654203485,
+          "y": 134.42863859315997,
+          "zoom": 1.0424657608411243
+        }
+      }
+    }
+  ],
+  "collections": [
+    {
+      "name": "bm_state",
+      "schema": {
+        "description": "Store to keep actual reusable data",
+        "fields": [
+          {
+            "name": "key",
+            "type": "string",
+            "required": true,
+            "index": true,
+            "description": "Fixed identifier of the record, e.g. maas-commands, baas-commands, etc"
+          },
+          {
+            "name": "data",
+            "type": "string",
+            "required": true,
+            "index": false,
+            "description": ""
+          }
+        ]
+      }
+    }
+  ],
+  "secrets": [
+    {
+      "name": "Jira_auth"
+    },
+    {
+      "name": "BAAS_API_KEY"
+    },
+    {
+      "name": "MAAS_API_KEY"
+    }
+  ],
+  "variables": [
+    {
+      "name": "JIRA_HOST"
+    },
+    {
+      "name": "BAAS_HOST"
+    },
+    {
+      "name": "MAAS_HOST"
+    }
+  ],
+  "providers": [
+    "anthropic"
+  ]
+}
